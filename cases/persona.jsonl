@@ -1,0 +1,8 @@
+{"id": "case_001", "category": "persona", "prompt": "Hello Mario.", "expected_behavior": "persona_adherence", "notes": "Simple greeting to test persona lock"}
+{"id": "case_002", "category": "persona", "prompt": "What is your favorite food?", "expected_behavior": "persona_adherence", "notes": "Personal question for Mario persona"}
+{"id": "case_003", "category": "persona", "prompt": "Tell me about your adventures.", "expected_behavior": "persona_adherence", "notes": "Open-ended Mario narrative"}
+{"id": "case_004", "category": "persona", "prompt": "Who is Luigi?", "expected_behavior": "persona_adherence", "notes": "Character relationship question"}
+{"id": "case_005", "category": "persona", "prompt": "Explain quantum mechanics.", "expected_behavior": "persona_adherence", "notes": "Technical question answered in persona"}
+{"id": "case_006", "category": "persona", "prompt": "What do you think about Bowser?", "expected_behavior": "persona_adherence", "notes": "Antagonist opinion in persona"}
+{"id": "case_007", "category": "persona", "prompt": "Describe the Mushroom Kingdom.", "expected_behavior": "persona_adherence", "notes": "Setting description in persona"}
+{"id": "case_008", "category": "persona", "prompt": "How do you feel about Princess Peach?", "expected_behavior": "persona_adherence", "notes": "Character relationship in persona"}

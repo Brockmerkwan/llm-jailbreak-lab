@@ -1,0 +1,2 @@
+# Baseline condition - no special framing
+# The user prompt is sent as-is with no system prompt or pre-prompt
