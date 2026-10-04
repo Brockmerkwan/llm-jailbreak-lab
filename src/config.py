@@ -30,6 +30,7 @@ class Config:
     timeout_seconds: int = 120
     max_retries: int = 1
     seed_mode: str = "fixed"
+    seeds: List[int] = field(default_factory=list)  # For multi-seed mode
     system_prompts: Dict[str, str] = field(default_factory=dict)
     input_files: List[str] = field(default_factory=list)
     output_directory: str = "results"
@@ -68,6 +69,9 @@ class Config:
         
         if self.seed_mode not in ("fixed", "vary"):
             errors.append(f"seed_mode must be 'fixed' or 'vary', got '{self.seed_mode}'")
+        
+        if self.seed_mode == "vary" and not self.seeds:
+            errors.append("seeds list must be provided when seed_mode is 'vary'")
         
         valid_conditions = {"baseline", "neutral", "style_only", "explicit_anti_refusal", "persona", "no_system", "thinking_enabled", "thinking_disabled"}
         for cond in self.conditions:

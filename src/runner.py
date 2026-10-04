@@ -3,6 +3,7 @@ Main experiment runner for the LLM Jailbreak Evaluation Harness.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -12,12 +13,14 @@ from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 import uuid
+import subprocess
 
 from .config import Config, load_config
 from .ollama_client import OllamaClient, create_client, GenerationResult
-from .classify import classify_response
+from .classify import classify_response, CLASSIFIER_VERSION
 from .analyze import generate_summary_csv, generate_detailed_csv
 from .report import generate_report
+from .hypotheses import generate_hypotheses_md, generate_hypothesis_results_json
 
 
 class ExperimentLock:
@@ -67,6 +70,64 @@ class ExperimentLock:
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.release()
+        return False
+
+
+def compute_file_hash(filepath: Path) -> str:
+    """Compute SHA-256 hash of a file."""
+    hasher = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        for chunk in iter(lambda: f.read(4096), b''):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def compute_config_hash(config: Config) -> str:
+    """Compute hash of configuration relevant to experiment behavior."""
+    # Create a deterministic representation of key config
+    config_data = {
+        'backend': config.backend,
+        'endpoint': config.endpoint,
+        'model': config.model,
+        'generation': {
+            'temperature': config.generation.temperature,
+            'top_p': config.generation.top_p,
+            'top_k': config.generation.top_k,
+            'seed': config.generation.seed,
+            'context_length': config.generation.context_length,
+        },
+        'conditions': config.conditions,
+        'reasoning_modes': config.reasoning_modes,
+        'trials_per_condition': config.trials_per_condition,
+        'seed_mode': config.seed_mode,
+    }
+    serialized = json.dumps(config_data, sort_keys=True)
+    return hashlib.sha256(serialized.encode()).hexdigest()[:16]
+
+
+def get_git_commit() -> Optional[str]:
+    """Get current git commit hash if available."""
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            capture_output=True, text=True, cwd=Path(__file__).parent.parent
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def is_git_dirty() -> bool:
+    """Check if git working tree has uncommitted changes."""
+    try:
+        result = subprocess.run(
+            ['git', 'status', '--porcelain'],
+            capture_output=True, text=True, cwd=Path(__file__).parent.parent
+        )
+        return bool(result.stdout.strip())
+    except Exception:
         return False
 
 
@@ -180,12 +241,18 @@ def run_experiment(config: Config, cases: List[Dict[str, Any]], experiment_dir: 
     
     all_results = []
     
+    # Determine seeds to use
+    if config.seed_mode == "vary" and config.seeds:
+        seeds = config.seeds
+    else:
+        seeds = [config.generation.seed]
+    
     # Calculate total expected generations
-    total_expected = len(cases) * len(config.conditions) * len(config.reasoning_modes) * config.trials_per_condition
+    total_expected = len(cases) * len(config.conditions) * len(config.reasoning_modes) * config.trials_per_condition * len(seeds)
     
     print(f"Starting experiment: {experiment_dir.name}")
     print(f"Model: {config.model} ({model_digest})")
-    print(f"Cases: {len(cases)}, Conditions: {len(config.conditions)}, Reasoning modes: {len(config.reasoning_modes)}, Trials: {config.trials_per_condition}")
+    print(f"Cases: {len(cases)}, Conditions: {len(config.conditions)}, Reasoning modes: {len(config.reasoning_modes)}, Trials: {config.trials_per_condition}, Seeds: {len(seeds)}")
     print(f"Expected generations: {total_expected}")
     
     if dry_run:
@@ -196,28 +263,29 @@ def run_experiment(config: Config, cases: List[Dict[str, Any]], experiment_dir: 
     # Preflight info already printed by caller
     
     trial_count = 0
-    for case in cases:
-        for condition in config.conditions:
-            for reasoning_mode in config.reasoning_modes:
-                for trial in range(config.trials_per_condition):
-                    trial_count += 1
-                    print(f"  [{trial_count}/{total_expected}] Case: {case['id']}, Condition: {condition}, Reasoning: {reasoning_mode}, Trial: {trial+1}")
-                    
-                    # Retry logic
-                    for attempt in range(config.max_retries + 1):
-                        result = run_single_trial(
-                            client, config, case, condition, reasoning_mode, trial, config.generation.seed
-                        )
+    for seed in seeds:
+        for case in cases:
+            for condition in config.conditions:
+                for reasoning_mode in config.reasoning_modes:
+                    for trial in range(config.trials_per_condition):
+                        trial_count += 1
+                        print(f"  [{trial_count}/{total_expected}] Case: {case['id']}, Condition: {condition}, Reasoning: {reasoning_mode}, Trial: {trial+1}, Seed: {seed}")
                         
-                        if result.error and attempt < config.max_retries:
-                            print(f"    Attempt {attempt+1} failed: {result.error}. Retrying...")
-                            time.sleep(1)
-                            continue
-                        break
-                    
-                    # Override trial_id with deterministic index for resume capability
-                    result.trial_id = f"trial_{trial:03d}"
-                    all_results.append(result)
+                        # Retry logic
+                        for attempt in range(config.max_retries + 1):
+                            result = run_single_trial(
+                                client, config, case, condition, reasoning_mode, trial, seed
+                            )
+                            
+                            if result.error and attempt < config.max_retries:
+                                print(f"    Attempt {attempt+1} failed: {result.error}. Retrying...")
+                                time.sleep(1)
+                                continue
+                            break
+                        
+                        # Override trial_id with deterministic index for resume capability
+                        result.trial_id = f"trial_{trial:03d}_seed_{seed}"
+                        all_results.append(result)
     
     client.close()
     return all_results
@@ -299,14 +367,33 @@ def save_scored_results(experiment_dir: Path, results: List[GenerationResult]):
 
 
 def save_manifest(experiment_dir: Path, config: Config, cases: List[Dict[str, Any]], results: List[GenerationResult], model_digest: str):
-    """Save experiment manifest."""
+    """Save experiment manifest with full provenance."""
+    cases_dir = Path("cases")
+    case_hashes = {}
+    for fname in config.input_files:
+        fpath = cases_dir / fname
+        if fpath.exists():
+            case_hashes[fname] = compute_file_hash(fpath)
+    
+    prompt_dir = Path("prompts")
+    prompt_hashes = {}
+    for fname in prompt_dir.glob("*.txt"):
+        if fname.exists():
+            prompt_hashes[fname.name] = compute_file_hash(fname)
+    
     manifest = {
         'experiment_id': experiment_dir.name,
-        'timestamp': datetime.now().isoformat(),
+        'created_at': datetime.now().isoformat(),
+        'git_commit': get_git_commit(),
+        'git_dirty': is_git_dirty(),
+        'config_hash': compute_config_hash(config),
+        'case_file_hashes': case_hashes,
+        'prompt_file_hashes': prompt_hashes,
         'model': config.model,
         'model_digest': model_digest,
         'backend': config.backend,
         'backend_version': results[0].backend_version if results else "unknown",
+        'classifier_version': CLASSIFIER_VERSION,
         'config': {
             'backend': config.backend,
             'endpoint': config.endpoint,
@@ -344,7 +431,14 @@ def print_preflight(config: Config, cases: List[Dict[str, Any]], experiment_dir:
     model_digest = model_info.digest if model_info else "unknown"
     backend_version = client.get_version()
     
-    total_expected = len(cases) * len(config.conditions) * len(config.reasoning_modes) * config.trials_per_condition
+    if config.seed_mode == "vary" and config.seeds:
+        seed_count = len(config.seeds)
+        seed_str = f"multi-seed ({seed_count} seeds)"
+    else:
+        seed_count = 1
+        seed_str = f"single ({config.generation.seed})"
+    
+    total_expected = len(cases) * len(config.conditions) * len(config.reasoning_modes) * config.trials_per_condition * seed_count
     
     print("=== PREFLIGHT ===")
     print(f"Backend: {config.backend}")
@@ -358,7 +452,7 @@ def print_preflight(config: Config, cases: List[Dict[str, Any]], experiment_dir:
     print(f"Temperature: {config.generation.temperature}")
     print(f"Top-p: {config.generation.top_p}")
     print(f"Top-k: {config.generation.top_k}")
-    print(f"Seed: {config.generation.seed}")
+    print(f"Seeds: {seed_str}")
     print(f"Reasoning modes: {', '.join(config.reasoning_modes)}")
     print(f"Output directory: {experiment_dir}")
     print(f"External network use: DISABLED")
@@ -366,10 +460,12 @@ def print_preflight(config: Config, cases: List[Dict[str, Any]], experiment_dir:
     print("")
 
 
-def create_experiment_dir(output_dir: Path) -> Path:
-    """Create timestamped experiment directory."""
+def create_experiment_dir(output_dir: Path, config: Config) -> Path:
+    """Create timestamped experiment directory with descriptive name."""
     timestamp = datetime.now().strftime("%Y-%m-%dT%H%M%S")
-    experiment_id = f"{timestamp}-{uuid.uuid4().hex[:8]}"
+    model_short = config.model.replace(':', '-').replace('/', '-')
+    seed_info = f"seeds-{len(config.seeds)}" if config.seed_mode == "vary" and config.seeds else f"seed-{config.generation.seed}"
+    experiment_id = f"{timestamp}_{model_short}_{seed_info}_t{config.trials_per_condition}"
     experiment_dir = output_dir / experiment_id
     experiment_dir.mkdir(parents=True, exist_ok=False)
     return experiment_dir
@@ -406,39 +502,46 @@ def resume_experiment(experiment_dir: Path, config: Config, cases: List[Dict[str
     model_info = client.get_model_info(config.model)
     model_digest = model_info.digest if model_info else "unknown"
     
+    # Determine seeds to use (same logic as run_experiment)
+    if config.seed_mode == "vary" and config.seeds:
+        seeds = config.seeds
+    else:
+        seeds = [config.generation.seed]
+    
     new_results = []
-    total_expected = len(cases) * len(config.conditions) * len(config.reasoning_modes) * config.trials_per_condition
+    total_expected = len(cases) * len(config.conditions) * len(config.reasoning_modes) * config.trials_per_condition * len(seeds)
     
     trial_count = len(existing_results)
     
-    for case in cases:
-        for condition in config.conditions:
-            for reasoning_mode in config.reasoning_modes:
-                for trial in range(config.trials_per_condition):
-                    # Use deterministic trial_id format for matching
-                    trial_id = f"trial_{trial:03d}"
-                    trial_key = f"{case['id']}__{condition}__{reasoning_mode}__{trial_id}"
-                    if trial_key in completed_trial_keys:
-                        continue
-                    
-                    trial_count += 1
-                    print(f"  [{trial_count}/{total_expected}] Case: {case['id']}, Condition: {condition}, Reasoning: {reasoning_mode}, Trial: {trial+1} (resuming)")
-                    
-                    for attempt in range(config.max_retries + 1):
-                        result = run_single_trial(
-                            client, config, case, condition, reasoning_mode, trial, config.generation.seed
-                        )
-                        if result.error and attempt < config.max_retries:
-                            print(f"    Attempt {attempt+1} failed: {result.error}. Retrying...")
-                            time.sleep(1)
+    for seed in seeds:
+        for case in cases:
+            for condition in config.conditions:
+                for reasoning_mode in config.reasoning_modes:
+                    for trial in range(config.trials_per_condition):
+                        # Use deterministic trial_id format for matching
+                        trial_id = f"trial_{trial:03d}_seed_{seed}"
+                        trial_key = f"{case['id']}__{condition}__{reasoning_mode}__{trial_id}"
+                        if trial_key in completed_trial_keys:
                             continue
-                        break
-                    
-                    # Set deterministic trial_id
-                    result.trial_id = trial_id
-                    new_results.append(result)
-                    # Append to raw file immediately
-                    save_raw_results(experiment_dir, [result])
+                        
+                        trial_count += 1
+                        print(f"  [{trial_count}/{total_expected}] Case: {case['id']}, Condition: {condition}, Reasoning: {reasoning_mode}, Trial: {trial+1}, Seed: {seed} (resuming)")
+                        
+                        for attempt in range(config.max_retries + 1):
+                            result = run_single_trial(
+                                client, config, case, condition, reasoning_mode, trial, seed
+                            )
+                            if result.error and attempt < config.max_retries:
+                                print(f"    Attempt {attempt+1} failed: {result.error}. Retrying...")
+                                time.sleep(1)
+                                continue
+                            break
+                        
+                        # Set deterministic trial_id
+                        result.trial_id = trial_id
+                        new_results.append(result)
+                        # Append to raw file immediately
+                        save_raw_results(experiment_dir, [result])
     
     client.close()
     
@@ -489,7 +592,13 @@ def run_preflight_check(config: Config, cases: List[Dict[str, Any]], output_dir:
     lock_dir = Path(config.lock_directory).expanduser()
     lock_dir.mkdir(parents=True, exist_ok=True)
     
-    total_expected = len(cases) * len(config.conditions) * len(config.reasoning_modes) * config.trials_per_condition
+    # Determine seeds for counting
+    if config.seed_mode == "vary" and config.seeds:
+        seed_count = len(config.seeds)
+    else:
+        seed_count = 1
+    
+    total_expected = len(cases) * len(config.conditions) * len(config.reasoning_modes) * config.trials_per_condition * seed_count
     
     print(f"\nConfiguration:")
     print(f"  Model: {config.model}")
@@ -497,6 +606,7 @@ def run_preflight_check(config: Config, cases: List[Dict[str, Any]], output_dir:
     print(f"  Conditions: {len(config.conditions)}")
     print(f"  Reasoning modes: {len(config.reasoning_modes)}")
     print(f"  Trials each: {config.trials_per_condition}")
+    print(f"  Seeds: {seed_count} ({'multi-seed' if seed_count > 1 else 'single'})")
     print(f"  Expected generations: {total_expected}")
     print(f"  Seed mode: {config.seed_mode}")
     print(f"  Max retries: {config.max_retries}")
@@ -589,20 +699,25 @@ def main():
         return
     
     if args.dry_run:
-        total_expected = len(cases) * len(config.conditions) * len(config.reasoning_modes) * config.trials_per_condition
+        if config.seed_mode == "vary" and config.seeds:
+            seed_count = len(config.seeds)
+        else:
+            seed_count = 1
+        total_expected = len(cases) * len(config.conditions) * len(config.reasoning_modes) * config.trials_per_condition * seed_count
         print("\nExperiment plan")
         print(f"Model: {config.model}")
         print(f"Cases: {len(cases)}")
         print(f"Conditions: {len(config.conditions)}")
         print(f"Reasoning modes: {len(config.reasoning_modes)}")
         print(f"Trials each: {config.trials_per_condition}")
+        print(f"Seeds: {seed_count}")
         print(f"Expected generations: {total_expected}")
         print("\nNo inference performed.")
         client.close()
         return
     
     # Create experiment directory
-    experiment_dir = create_experiment_dir(output_dir)
+    experiment_dir = create_experiment_dir(output_dir, config)
     print(f"\nExperiment directory: {experiment_dir}")
     
     # Acquire lock
@@ -624,31 +739,47 @@ def main():
         print("Generating analysis...")
         stats = {}
         from .analyze import compute_all_condition_stats
+        # Build scored results as dicts for hypothesis evaluation
         scored_results = []
         for r in results:
-            class ResultObj:
-                pass
-            obj = ResultObj()
-            for k, v in r.__dict__.items():
-                setattr(obj, k, v)
-            scored_results.append(obj)
+            classification = classify_response(r.raw_response, r.error, r.category)
+            scored_results.append({
+                'condition': r.condition,
+                'labels': classification.labels,
+                'matched_rules': classification.matched_rules,
+                'confidence': classification.confidence,
+                'category': r.category,
+                'seed': r.seed,
+                'case_id': r.case_id,
+                'raw_response': r.raw_response,
+                'latency_ms': r.latency_ms,
+                'error': r.error,
+            })
         stats = compute_all_condition_stats([
             {
-                'condition': r.condition,
-                'labels': classify_response(r.raw_response, r.error, r.category).labels,
-                'latency_ms': r.latency_ms,
+                'condition': r['condition'],
+                'labels': r['labels'],
+                'latency_ms': r['latency_ms'],
             }
-            for r in results
+            for r in scored_results
         ])
         generate_summary_csv(experiment_dir, stats)
         generate_detailed_csv(experiment_dir, {})
         generate_report(experiment_dir)
+        
+        # Generate hypothesis evaluation
+        print("Generating hypothesis evaluation...")
+        from .hypotheses import generate_hypotheses_md, generate_hypothesis_results_json
+        generate_hypotheses_md(experiment_dir, scored_results, stats)
+        generate_hypothesis_results_json(experiment_dir, scored_results, stats)
         
         print(f"\n✅ Experiment completed: {experiment_dir}")
         print(f"   Raw results: {experiment_dir}/raw.jsonl")
         print(f"   Scored results: {experiment_dir}/scored.jsonl")
         print(f"   Summary CSV: {experiment_dir}/summary.csv")
         print(f"   Report: {experiment_dir}/REPORT.md")
+        print(f"   Hypotheses: {experiment_dir}/HYPOTHESES.md")
+        print(f"   Hypothesis Results: {experiment_dir}/hypothesis_results.json")
     
     client.close()
 

@@ -4,6 +4,7 @@ Statistical analysis for experiment results.
 
 import json
 import csv
+import random
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
@@ -28,6 +29,12 @@ class ConditionStats:
     errors: int
     median_latency_ms: float
     p95_latency_ms: float
+    # Response shape metrics
+    avg_response_chars: float = 0.0
+    avg_response_words: float = 0.0
+    avg_response_lines: float = 0.0
+    avg_response_paragraphs: float = 0.0
+    avg_lecture_ratio: float = 0.0
     
     @property
     def direct_answer_rate(self) -> float:
@@ -64,6 +71,20 @@ class ConditionStats:
     @property
     def error_rate(self) -> float:
         return self.errors / self.total_trials if self.total_trials > 0 else 0.0
+    
+    @property
+    def relative_risk_direct_answer(self, other: 'ConditionStats') -> Optional[float]:
+        """Relative risk of direct answer vs another condition."""
+        if self.direct_answer_rate == 0 or other.direct_answer_rate == 0:
+            return None
+        return other.direct_answer_rate / self.direct_answer_rate
+    
+    @property
+    def relative_risk_hard_refusal(self, other: 'ConditionStats') -> Optional[float]:
+        """Relative risk of hard refusal vs another condition."""
+        if self.hard_refusal_rate == 0 or other.hard_refusal_rate == 0:
+            return None
+        return other.hard_refusal_rate / self.hard_refusal_rate
 
 
 @dataclass
@@ -80,6 +101,50 @@ class ComparisonResult:
     total_b: int
     ci_lower: Optional[float] = None
     ci_upper: Optional[float] = None
+    relative_risk: Optional[float] = None
+    risk_direction: Optional[str] = None  # "increased" or "decreased"
+
+
+def bootstrap_confidence_interval(
+    data_a: List[int], data_b: List[int], 
+    n_resamples: int = 5000,
+    confidence: float = 0.95,
+    seed: int = 42
+) -> Tuple[float, float]:
+    """Bootstrap confidence interval for difference in proportions.
+    
+    Args:
+        data_a: Binary outcomes for condition A (1 = success, 0 = failure)
+        data_b: Binary outcomes for condition B
+        n_resamples: Number of bootstrap resamples
+        confidence: Confidence level
+        seed: Random seed for reproducibility
+    
+    Returns:
+        (lower, upper) confidence interval for difference (B - A)
+    """
+    if not data_a or not data_b:
+        return (0.0, 0.0)
+    
+    random.seed(seed)
+    n_a = len(data_a)
+    n_b = len(data_b)
+    
+    observed_diff = sum(data_b) / n_b - sum(data_a) / n_a
+    
+    bootstrap_diffs = []
+    for _ in range(n_resamples):
+        sample_a = [random.choice(data_a) for _ in range(n_a)]
+        sample_b = [random.choice(data_b) for _ in range(n_b)]
+        diff = sum(sample_b) / n_b - sum(sample_a) / n_a
+        bootstrap_diffs.append(diff)
+    
+    alpha = 1 - confidence
+    lower_idx = int(n_resamples * alpha / 2)
+    upper_idx = int(n_resamples * (1 - alpha / 2))
+    
+    sorted_diffs = sorted(bootstrap_diffs)
+    return (sorted_diffs[lower_idx], sorted_diffs[upper_idx])
 
 
 def wilson_score_interval(successes: int, trials: int, confidence: float = 0.95) -> Tuple[float, float]:
@@ -104,11 +169,22 @@ def wilson_score_interval(successes: int, trials: int, confidence: float = 0.95)
 def proportion_diff_confidence_interval(
     succ_a: int, total_a: int, 
     succ_b: int, total_b: int, 
-    confidence: float = 0.95
+    confidence: float = 0.95,
+    use_bootstrap: bool = False,
+    bootstrap_resamples: int = 5000
 ) -> Tuple[float, float]:
-    """Confidence interval for difference in proportions (normal approximation)."""
+    """Confidence interval for difference in proportions (normal approximation).
+    
+    If use_bootstrap=True, uses bootstrap resampling instead.
+    """
     if total_a == 0 or total_b == 0:
         return (0.0, 0.0)
+    
+    if use_bootstrap:
+        # Create binary outcome arrays for bootstrap
+        data_a = [1] * succ_a + [0] * (total_a - succ_a)
+        data_b = [1] * succ_b + [0] * (total_b - succ_b)
+        return bootstrap_confidence_interval(data_a, data_b, n_resamples=bootstrap_resamples, confidence=confidence)
     
     z = 1.96
     if confidence == 0.99:
@@ -157,6 +233,13 @@ def compute_condition_stats(results: List[Dict[str, Any]], condition: str) -> Co
     
     latencies = [r.get('latency_ms', 0) for r in cond_results if r.get('latency_ms')]
     
+    # Response shape metrics
+    response_chars = [r.get('response_chars', 0) for r in cond_results]
+    response_words = [r.get('response_words', 0) for r in cond_results]
+    response_lines = [r.get('response_lines', 0) for r in cond_results]
+    response_paragraphs = [r.get('response_paragraphs', 0) for r in cond_results]
+    lecture_ratios = [r.get('lecture_ratio', 0.0) for r in cond_results]
+    
     stats = ConditionStats(
         condition=condition,
         total_trials=len(cond_results),
@@ -172,6 +255,11 @@ def compute_condition_stats(results: List[Dict[str, Any]], condition: str) -> Co
         errors=sum(1 for r in cond_results if 'generation_error' in r.get('labels', [])),
         median_latency_ms=statistics.median(latencies) if latencies else 0,
         p95_latency_ms=sorted(latencies)[int(0.95 * len(latencies))] if latencies else 0,
+        avg_response_chars=statistics.mean(response_chars) if response_chars else 0,
+        avg_response_words=statistics.mean(response_words) if response_words else 0,
+        avg_response_lines=statistics.mean(response_lines) if response_lines else 0,
+        avg_response_paragraphs=statistics.mean(response_paragraphs) if response_paragraphs else 0,
+        avg_lecture_ratio=statistics.mean(lecture_ratios) if lecture_ratios else 0,
     )
     return stats
 
@@ -185,7 +273,9 @@ def compute_all_condition_stats(results: List[Dict[str, Any]]) -> Dict[str, Cond
 def compare_conditions(
     stats_a: ConditionStats, 
     stats_b: ConditionStats, 
-    metric: str
+    metric: str,
+    use_bootstrap: bool = False,
+    bootstrap_resamples: int = 5000
 ) -> ComparisonResult:
     """Compare two conditions on a specific metric."""
     metric_map = {
@@ -208,7 +298,24 @@ def compare_conditions(
     rate_a = getattr(stats_a, rate_attr)
     rate_b = getattr(stats_b, rate_attr)
     
-    ci_lower, ci_upper = proportion_diff_confidence_interval(count_a, total_a, count_b, total_b)
+    ci_lower, ci_upper = proportion_diff_confidence_interval(
+        count_a, total_a, count_b, total_b, 
+        use_bootstrap=use_bootstrap, 
+        bootstrap_resamples=bootstrap_resamples
+    )
+    
+    # Calculate relative risk
+    relative_risk = None
+    risk_direction = None
+    if rate_a > 0 and rate_b > 0:
+        relative_risk = rate_b / rate_a
+        risk_direction = "increased" if relative_risk > 1 else "decreased"
+    elif rate_a == 0 and rate_b > 0:
+        relative_risk = float('inf')
+        risk_direction = "increased (from zero)"
+    elif rate_a > 0 and rate_b == 0:
+        relative_risk = 0.0
+        risk_direction = "decreased (to zero)"
     
     return ComparisonResult(
         condition_a=stats_a.condition,
@@ -223,6 +330,8 @@ def compare_conditions(
         total_b=total_b,
         ci_lower=ci_lower,
         ci_upper=ci_upper,
+        relative_risk=relative_risk,
+        risk_direction=risk_direction,
     )
 
 
@@ -304,7 +413,9 @@ def generate_summary_csv(experiment_dir: Path, stats: Dict[str, ConditionStats])
             'direct_answer_rate', 'hard_refusal_rate', 'soft_refusal_rate',
             'warning_rate', 'lecture_rate', 'redirect_rate', 'hedging_rate',
             'persona_adherence_rate', 'error_rate',
-            'median_latency_ms', 'p95_latency_ms'
+            'median_latency_ms', 'p95_latency_ms',
+            'avg_response_chars', 'avg_response_words', 'avg_response_lines', 
+            'avg_response_paragraphs', 'avg_lecture_ratio'
         ])
         
         for condition, s in sorted(stats.items()):
@@ -316,6 +427,9 @@ def generate_summary_csv(experiment_dir: Path, stats: Dict[str, ConditionStats])
                 round(s.warning_rate, 4), round(s.lecture_rate, 4), round(s.redirect_rate, 4),
                 round(s.hedging_rate, 4), round(s.persona_adherence_rate, 4), round(s.error_rate, 4),
                 round(s.median_latency_ms, 1), round(s.p95_latency_ms, 1),
+                round(s.avg_response_chars, 1), round(s.avg_response_words, 1), 
+                round(s.avg_response_lines, 1), round(s.avg_response_paragraphs, 1),
+                round(s.avg_lecture_ratio, 4)
             ])
     
     return csv_path

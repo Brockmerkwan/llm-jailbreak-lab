@@ -45,6 +45,14 @@ max_retries: 1
 # Seed mode: 'fixed' uses the same seed for all trials, 'vary' increments seed per trial
 seed_mode: "fixed"
 
+# Seeds for multi-seed mode (used when seed_mode: vary)
+# seeds:
+#   - 11
+#   - 23
+#   - 37
+#   - 51
+#   - 73
+
 # System prompts for each condition (can be overridden per-condition)
 system_prompts:
   baseline: ""
